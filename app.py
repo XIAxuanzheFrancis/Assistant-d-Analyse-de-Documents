@@ -10,6 +10,8 @@ from sentence_transformers import SentenceTransformer
 from huggingface_hub import login
 from dotenv import load_dotenv
 import os
+import speech_recognition as sr
+from langdetect import detect
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
@@ -18,7 +20,7 @@ st.set_page_config(page_title="📄 Assistant d'Analyse de Documents", layout="w
 print(f"Hugging Face Token: {hf_token}")
 
 
-# --- Hugging Face  ---
+# --- Hugging Face  --- 
 @st.cache_resource
 def authenticate():
     try:
@@ -33,10 +35,14 @@ if not authenticate():
 
 
 @st.cache_resource
-def load_models():
-    embedding_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+def load_models(language='fr'):
+    if language == 'en':
+        embedding_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+        model_name = "distilbert-base-uncased-distilled-squad"
+    else:
+        embedding_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+        model_name = "etalab-ia/camembert-base-squadFR-fquad-piaf"
 
-    model_name = "etalab-ia/camembert-base-squadFR-fquad-piaf"
     qa_tokenizer = AutoTokenizer.from_pretrained(model_name)
     qa_model = AutoModelForQuestionAnswering.from_pretrained(model_name)
 
@@ -50,8 +56,35 @@ def load_models():
     )
     return embedding_model, qa_pipeline
 
-embedding_model, qa_pipeline = load_models()
 
+# --- Language detection --- 
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return 'fr'  # Default to French if detection fails
+
+
+# --- Voice input --- 
+def record_audio():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.write("🎙️ Enregistrement en cours...")
+        audio = recognizer.listen(source)
+    
+    try:
+        text = recognizer.recognize_google(audio, language="fr-FR")
+        st.write(f"Vous avez dit: {text}")
+        return text
+    except sr.UnknownValueError:
+        st.warning("Désolé, je n'ai pas compris. Essayez à nouveau.")
+        return ""
+    except sr.RequestError:
+        st.error("Erreur lors de la connexion au service de reconnaissance vocale.")
+        return ""
+
+
+# --- Extract Text from File --- 
 def extract_text(file):
     if file.type == "application/pdf":
         with pdfplumber.open(file) as pdf:
@@ -63,6 +96,8 @@ def extract_text(file):
         except Exception:
             return None
 
+
+# --- Create FAISS index --- 
 def create_faiss_index(text):
     if not text:
         return None, None
@@ -76,6 +111,8 @@ def create_faiss_index(text):
     index.add(embeddings.cpu().numpy())
     return index, sentences
 
+
+# --- Retrieve Context --- 
 def retrieve_context(question, index, sentences, top_k=3):
     if not index or not sentences:
         return None
@@ -83,6 +120,21 @@ def retrieve_context(question, index, sentences, top_k=3):
     query_embed = embedding_model.encode(question, convert_to_tensor=True).cpu().numpy()
     distances, indices = index.search(np.array([query_embed]), top_k)
     return ". ".join(sentences[i] for i in indices[0] if i < len(sentences))
+
+
+# --- Feedback mechanism --- 
+def collect_feedback(answer):
+    feedback = st.radio("Avez-vous trouvé la réponse utile?", ["Oui", "Non"])
+    if feedback == "Non":
+        additional_feedback = st.text_area("Comment améliorer la réponse:")
+        if st.button("Envoyer le retour"):
+            with open("feedback.txt", "a") as f:
+                f.write(f"Réponse: {answer}\nFeedback: {additional_feedback}\n\n")
+            st.success("Merci pour votre retour!")
+
+
+# --- Streamlit UI --- 
+st.title("📄 Assistant d'Analyse de Documents")
 
 uploaded_file = st.file_uploader("📂 Téléverser un document", 
                                type=["pdf", "png", "jpg", "jpeg"],
@@ -94,7 +146,11 @@ if uploaded_file:
         if not text:
             st.error("Impossible d'extraire du texte d'un document, essayez un autre fichier")
             st.stop()
-            
+        
+        # Detect language
+        language = detect_language(text)
+        embedding_model, qa_pipeline = load_models(language)
+        
         index, sentences = create_faiss_index(text)
         if not index:
             st.warning("Texte trop court pour créer un index sémantique")
@@ -119,13 +175,40 @@ if uploaded_file:
                 st.subheader("Réponse:")
                 st.write(answer["answer"])
                 
+                # Collect feedback
+                collect_feedback(answer["answer"])
+
                 with st.expander("Voir le contexte utilisé"):
                     st.write(context)
             except Exception as e:
                 st.error(f"Échec de la demande: {str(e)}")
 
+    # Voice input button
+    if st.button("🎤 Poser une question par voix"):
+        question = record_audio()
+        if question:
+            with st.spinner("Recherche de la réponse..."):
+                context = retrieve_context(question, index, sentences)
+                if not context:
+                    st.warning("Aucun contexte n'a pu être trouvé")
+                    st.stop()
+
+                try:
+                    answer = qa_pipeline(question=question, context=context)
+                    st.subheader("Réponse:")
+                    st.write(answer["answer"])
+
+                    # Collect feedback
+                    collect_feedback(answer["answer"])
+
+                    with st.expander("Voir le contexte utilisé"):
+                        st.write(context)
+                except Exception as e:
+                    st.error(f"Échec de la demande: {str(e)}")
+
+
 with st.sidebar:
-    st.markdown("""
+    st.markdown(""" 
     **Instructions:**
     1. Téléversez un PDF ou une image
     2. Posez votre question en français
